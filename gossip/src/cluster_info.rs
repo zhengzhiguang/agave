@@ -100,6 +100,8 @@ use {
 pub const GOSSIP_SLEEP_MILLIS: u64 = 100;
 /// Interval between pull requests (in gossip rounds)
 const PULL_REQUEST_PERIOD: usize = 5;
+/// Max times we try to send ping to entrypoints at bootstrap phase
+const MAX_TIMES_ENTRYPOINTS_PINGED: usize = 3;
 
 /// Capacity for the [`ClusterInfo::run_socket_consume`] and [`ClusterInfo::run_listen`]
 /// intermediate packet batch buffers.
@@ -142,6 +144,7 @@ fn pull_request_scan_cost(scan_entries: usize, bloom_hash_count: usize) -> u64 {
 
 pub const DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS: u64 = 10_000;
 pub const DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS: u64 = 60_000;
+pub const DEFAULT_ENTRYPOINTS_PING_INTERVAL_MILLIS: u64 = 5_000;
 // Limit number of unique pubkeys in the crds table.
 pub(crate) const CRDS_UNIQUE_PUBKEY_CAPACITY: usize = 8192;
 
@@ -196,6 +199,7 @@ pub struct ClusterInfo {
     sigverify_cache: SigVerifyCache,
     /// Alpenglow migration status
     migration_status: OnceLock<Arc<MigrationStatus>>,
+    entrypoints_ping_interval: u64,  // milliseconds, 0 = disabled
 }
 
 impl ClusterInfo {
@@ -235,6 +239,7 @@ impl ClusterInfo {
             bind_ip_addrs: Arc::new(BindIpAddrs::default()),
             sigverify_cache: SigVerifyCache::new(),
             migration_status: OnceLock::new(),
+            entrypoints_ping_interval: DEFAULT_ENTRYPOINTS_PING_INTERVAL_MILLIS,
         };
         me.refresh_my_gossip_contact_info();
         me
@@ -1467,6 +1472,41 @@ impl ClusterInfo {
             .all(|entrypoint| entrypoint.pubkey() != &Pubkey::default())
     }
 
+    fn try_send_ping_message_to_entrypoints(
+        &self,
+        recycler: &PacketBatchRecycler,
+        sender: &impl ChannelSend<PacketBatch>
+    ) -> bool {
+        let mut entrypoints = self.entrypoints.write().unwrap();
+        if entrypoints.is_empty() {
+            // No entrypoint specified.  Nothing more to process
+            return true;
+        }
+
+        let mut rng = rand::rng();
+        let mut packet_batch = RecycledPacketBatch::new_with_recycler(
+            recycler, 0, "try_send_ping_message_to_entrypoints");
+
+        for entrypoint in entrypoints.iter_mut() {
+           let ping = Ping::new(rng.random(), &self.keypair());
+           let ping = Protocol::PingMessage(ping);
+           let Some(addr) = entrypoint.gossip() else {
+               continue;
+           };
+           if let Some(pkt) = make_gossip_packet(&addr, &ping, &self.stats) {
+                packet_batch.push(pkt);
+           }
+           // This is to facilitate sending pull requests to entrypoints at bootstrap phase
+           entrypoint.set_wallclock(0);
+        }
+        if !packet_batch.is_empty()
+            && let Err(TrySendError::Full(_packet_batch)) = sender.try_send(packet_batch.into())
+        {
+            return false;
+        }
+        return true;
+    }
+
     fn handle_purge(&self, thread_pool: &ThreadPool, stakes: &HashMap<Pubkey, u64>) {
         let self_pubkey = self.id();
         let timeouts = self
@@ -1523,6 +1563,8 @@ impl ClusterInfo {
                 let mut last_push = 0;
                 let mut last_contact_info_trace = timestamp();
                 let mut last_contact_info_save = timestamp();
+                let mut last_entrypoints_ping = 0;
+                let mut entrypoints_pinged_max_times = 0;
                 let mut entrypoints_processed = false;
                 let recycler = PacketBatchRecycler::default();
 
@@ -1541,6 +1583,24 @@ impl ClusterInfo {
                             self.rpc_info_trace()
                         );
                         last_contact_info_trace = start;
+                    }
+
+                    // try to send ping to entrypoints
+                    if self.entrypoints_ping_interval != 0
+                        && start - last_entrypoints_ping > self.entrypoints_ping_interval
+                    {
+                        if entrypoints_pinged_max_times <= MAX_TIMES_ENTRYPOINTS_PINGED {
+                            self.try_send_ping_message_to_entrypoints(&recycler, &sender);
+                            entrypoints_pinged_max_times += 1;
+                        }
+                        last_entrypoints_ping = start;
+                    }
+                    // This is to facilitate sending pull requests to entrypoints at bootstrap phase
+                    if entrypoints_pinged_max_times <= MAX_TIMES_ENTRYPOINTS_PINGED {
+                        let mut entrypoints = self.entrypoints.write().unwrap();
+                        for entrypoint in entrypoints.iter_mut() {
+                            entrypoint.set_wallclock(0);
+                        }
                     }
 
                     if self.contact_save_interval != 0
@@ -1766,6 +1826,7 @@ impl ClusterInfo {
                 &self.stats,
             )
         };
+
         // Prioritize more recent values, staked values and ContactInfos.
         let get_score = |value: &CrdsValue| -> u64 {
             let age = now.saturating_sub(value.wallclock());
